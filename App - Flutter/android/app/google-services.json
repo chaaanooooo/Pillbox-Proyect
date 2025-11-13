@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "334029671804",
+    "project_id": "pillbox-e83d7",
+    "storage_bucket": "pillbox-e83d7.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:334029671804:android:28396eaa9cb5a66baf68f9",
+        "android_client_info": {
+          "package_name": "com.example.pillbox"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDKyNmIMLRvSFKtU_O1gfSmCj7lx6DImnw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:334029671804:android:e245229a3db0f9cbaf68f9",
+        "android_client_info": {
+          "package_name": "com.pillboxcompany.pillbox"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDKyNmIMLRvSFKtU_O1gfSmCj7lx6DImnw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
