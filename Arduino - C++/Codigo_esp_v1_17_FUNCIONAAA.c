@@ -1,0 +1,607 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+/* ====== CONSIDERDACIONES =====
+ Las lineas con Serial solamente ej.: "Linea 60:Serial.println("❌ No hay WiFi para sincronizar NTP");" son de debugg y se muestran por la consola del IDE arduino. 
+ Las lineas con Serial2 son las que se envian al arduino por el canal serial de los pines 16 y 17 
+*/
+
+// ====== WiFi del hogar ======
+const char* WIFI_SSID = "Claro123";
+const char* WIFI_PASS = "Mili1210";
+
+// ====== Serial hacia Arduino UNO ======
+#define UNO_RX 16   // ESP32 RX2  <- UNO TX (pin 1)
+#define UNO_TX 17   // ESP32 TX2  -> UNO RX (pin 0)
+
+// ====== Firestore ======
+const char* FIREBASE_API_KEY    = "AIzaSyDKyNmIMLRvSFKtU_O1gfSmCj7lx6DImnw";
+const char* FIREBASE_PROJECT_ID = "pillbox-e83d7";
+
+// ID físico del pastillero (el del QR / documento)
+const char* DEVICE_ID = "PB-0001";
+
+// Debe coincidir con NAME_LENGTH del Arduino
+const int MAX_NAME_LENGTH = 12;
+
+// ====== Variables globales ======
+String g_ownerUID;
+String g_ownerNameLCD;
+
+// Hash numérico de 32 bits para detectar cambios en meds
+uint32_t g_lastMedsHash = 0;
+
+unsigned long lastWifiCheck = 0;
+unsigned long lastSyncAttempt = 0;
+unsigned long lastLinkCheck = 0;
+bool lastWifiStatus = false;
+bool deviceLinked = false;
+
+const unsigned long SYNC_RETRY_INTERVAL = 30000;    // 30 segundos
+const unsigned long LINK_CHECK_INTERVAL = 30000;   // 🔴 5 minutos (era 30s)
+
+// ====== NTP para sincronización de hora ======
+const char* NTP_SERVER = "pool.ntp.org";
+const long GMT_OFFSET_SEC = -3 * 3600;  // GMT-3 para Argentina
+const int DAYLIGHT_OFFSET_SEC = 0;       // Argentina no usa DST
+
+unsigned long lastNTPSync = 0;
+const unsigned long NTP_SYNC_INTERVAL = 3600000;  // Sincronizar cada 1 hora
+bool ntpSynced = false;
+
+
+// -----------------------------------------------------
+// Sincronizar hora con NTP
+// -----------------------------------------------------
+bool syncNTPTime() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ No hay WiFi para sincronizar NTP");
+    return false;
+  }
+
+  Serial.println("🕐 Sincronizando hora con NTP...");
+  
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  
+  // Esperar hasta 10 segundos para obtener la hora
+  int attempts = 0;
+  struct tm timeinfo;
+  while (!getLocalTime(&timeinfo) && attempts < 20) {
+    delay(500);
+    attempts++;
+    Serial.print(".");
+  }
+  
+  if (attempts >= 20) {
+    Serial.println("\n❌ Timeout obteniendo hora NTP");
+    return false;
+  }
+  
+  Serial.println("\n✅ Hora NTP obtenida:");
+  Serial.printf("   %04d-%02d-%02d %02d:%02d:%02d\n",
+                timeinfo.tm_year + 1900,
+                timeinfo.tm_mon + 1,
+                timeinfo.tm_mday,
+                timeinfo.tm_hour,
+                timeinfo.tm_min,
+                timeinfo.tm_sec);
+  
+  ntpSynced = true;
+  lastNTPSync = millis();
+  return true;
+}
+
+// -----------------------------------------------------
+// Enviar hora al Arduino
+// -----------------------------------------------------
+void sendTimeToArduino() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("❌ No se pudo obtener hora local");
+    return;
+  }
+  
+  char cmd[64];
+  snprintf(cmd, sizeof(cmd), "SETTIME:%d:%d:%d:%d:%d:%d",
+           timeinfo.tm_year + 1900,
+           timeinfo.tm_mon + 1,
+           timeinfo.tm_mday,
+           timeinfo.tm_hour,
+           timeinfo.tm_min,
+           timeinfo.tm_sec);
+  
+  Serial.print("⏰ Enviando hora al Arduino: ");
+  Serial.println(cmd);
+  
+  Serial2.println(cmd);
+  delay(100);
+  
+  Serial.println("✅ Hora enviada al RTC del Arduino");
+}
+
+// -----------------------------------------------------
+// Conexión WiFi
+// -----------------------------------------------------
+void conectarWifi() {
+  Serial.println();
+  Serial.print("Conectando a WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  int intentos = 0;
+  while (WiFi.status() != WL_CONNECTED && intentos < 30) {
+    delay(500);
+    Serial.print(".");
+    intentos++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi conectado");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    Serial2.println("WIFI:ON");
+    lastWifiStatus = true;
+  } else {
+    Serial.println("\n❌ No se pudo conectar al WiFi");
+    Serial2.println("WIFI:OFF");
+    lastWifiStatus = false;
+  }
+}
+
+// -----------------------------------------------------
+// Helper Firestore URLs
+// -----------------------------------------------------
+String makeFirestoreUrl(const String& path) {
+  String url = "https://firestore.googleapis.com/v1/projects/";
+  url += FIREBASE_PROJECT_ID;
+  url += "/databases/(default)/documents/";
+  url += path;
+  
+  if (String(FIREBASE_API_KEY).length() > 0) {
+    url += "?key=";
+    url += FIREBASE_API_KEY;
+  }
+  return url;
+}
+
+// -----------------------------------------------------
+// Leer devices/{DEVICE_ID}
+// -----------------------------------------------------
+bool fetchOwnerUID() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ No hay WiFi para leer device");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  String url = makeFirestoreUrl("devices/" + String(DEVICE_ID));
+
+  Serial.println("🔍 GET device: " + url);
+
+  http.begin(client, url);
+  http.setTimeout(10000);
+  int code = http.GET();
+  
+  Serial.print("📡 HTTP code: ");
+  Serial.println(code);
+
+  if (code != 200) {
+    String payload = http.getString();
+    Serial.println("❌ Error HTTP: " + String(code));
+    Serial.println("Body: " + payload.substring(0, 200));
+    http.end();
+    return false;
+  }
+
+	/* Se reciben 2 Json, el primero contiene una estructura como la que se muestra:
+	{
+  "name": "projects/pillbox-e83d7/databases/(default)/documents/devices/PB-0001",
+  "fields": {
+    "claimCode": {
+      "stringValue": "K3D9-7F2L"
+    },
+    "createdAt": {
+      "timestampValue": "2025-10-21T03:00:00.812Z"
+    },
+    "ownerUID": {
+      "stringValue": "0kGVpHZOQCMJpnqkGMW5870FKL33"
+    }
+  },
+  "createTime": "2025-10-21T19:28:13.872908Z",
+  "updateTime": "2025-11-19T22:41:22.817440Z"
+	}
+	
+	De aca nos importa el OwnerUID que seria basicamente nuestro usuario y que es la referencia para decir que el dispositivo esta vinculado o no.
+	*/
+	
+  String payload = http.getString();
+  http.end();
+
+  StaticJsonDocument<4096> doc;
+  
+  // Verifica error de deserializado
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("❌ Error parseando JSON: ");
+    Serial.println(err.c_str());
+    return false;
+  }
+
+  JsonObject fields = doc["fields"];
+  // validamos que exista el campo "ownerUID" en el json
+  if (!fields.containsKey("ownerUID")) {
+    Serial.println("⚠️  Campo ownerUID NO existe → no vinculado");
+    Serial2.println("DEVICE:UNLINKED");
+    deviceLinked = false;
+    return false;
+  }
+	// validamos que el campo "ownerUID" en el json tenga algun contenido.
+  const char* ownerUID_c = fields["ownerUID"]["stringValue"] | "";
+  if (strlen(ownerUID_c) == 0) {
+    Serial.println("⚠️  ownerUID vacío → no vinculado");
+    Serial2.println("DEVICE:UNLINKED");
+    deviceLinked = false;
+    return false;
+  }
+
+  // === Vinculado correctamente ===
+  g_ownerUID = ownerUID_c;
+  String shortUID = g_ownerUID.substring(0, 6);
+  g_ownerNameLCD = "User_" + shortUID;
+  
+  // Truncar si es necesario
+  if (g_ownerNameLCD.length() > MAX_NAME_LENGTH) {
+    g_ownerNameLCD = g_ownerNameLCD.substring(0, MAX_NAME_LENGTH);
+  }
+
+  Serial.println("✅ Device vinculado a: " + g_ownerUID);
+  Serial.println("📱 Nombre LCD: " + g_ownerNameLCD);
+
+  Serial2.print("DEVICE:LINKED:");
+  Serial2.println(g_ownerNameLCD);
+  
+  deviceLinked = true;
+  return true;
+}
+
+// -----------------------------------------------------
+// FUNCIONES PARA CALCULAR HASH (FNV-1a)
+// -----------------------------------------------------
+void fnv1aUpdate(uint32_t &hash, const char* s) {
+  if (!s) return;
+  while (*s) {
+    hash ^= (uint8_t)(*s);
+    hash *= 16777619u;
+    s++;
+  }
+}
+
+void fnv1aUpdate(uint32_t &hash, const String& s) {
+  for (size_t i = 0; i < s.length(); i++) {
+    hash ^= (uint8_t)s[i];
+    hash *= 16777619u;
+  }
+}
+
+// -----------------------------------------------------
+// Calcular hash REAL del contenido de "meds"
+/* 
+	La funcion toma los valores de los campos del Json deserializado y utiliza la funcion fnv1aUpdate para calcular el hash de todos los campos.
+	Esto permite determinar si tenemos o no cambios en las medicinas. Utilizamos este resultado para saber si tenemos que actualizar las alarmas en el arduino o no.
+	De esta forma reducimos las escrituras en el arduino y evitamos saturarlo.
+*/
+// -----------------------------------------------------
+uint32_t calculateMedsHash(JsonDocument& doc) {
+  uint32_t hash = 2166136261u;  // base FNV-1a
+
+  if (!doc.containsKey("documents")) return hash;
+
+  JsonArray docs = doc["documents"].as<JsonArray>();
+
+  for (JsonVariant V : docs) {
+    JsonObject o = V.as<JsonObject>();
+
+    const char* docName    = o["name"]       | "";
+    const char* createTime = o["createTime"] | "";
+    const char* updateTime = o["updateTime"] | "";
+
+    JsonObject f = o["fields"];
+
+    const char* medName  = f["name"]["stringValue"]         | "";
+    const char* typeStr  = f["type"]["stringValue"]         | "";
+    const char* dosesStr = f["dosesPerDay"]["integerValue"] | "";
+
+    fnv1aUpdate(hash, docName);
+    fnv1aUpdate(hash, createTime);
+    fnv1aUpdate(hash, updateTime);
+    fnv1aUpdate(hash, medName);
+    fnv1aUpdate(hash, typeStr);
+    fnv1aUpdate(hash, dosesStr);
+
+    JsonArray times = f["times24h"]["arrayValue"]["values"].as<JsonArray>();
+    for (JsonVariant t : times) {
+      const char* ts = t["stringValue"] | "";
+      fnv1aUpdate(hash, ts);
+    }
+  }
+
+  return hash;
+}
+
+// -----------------------------------------------------
+// Leer meds y sincronizar al UNO
+// -----------------------------------------------------
+bool fetchMedsForUserAndSync(bool forceSync = false) {
+  if (WiFi.status() != WL_CONNECTED) {
+	 
+    Serial.println("❌ No hay WiFi para leer meds");
+    return false;
+  }
+  
+  if (g_ownerUID.isEmpty()) {
+	 
+    Serial.println("❌ No hay ownerUID cargado");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  String url = makeFirestoreUrl("users/" + g_ownerUID + "/meds");
+
+  Serial.println("🔍 GET meds: " + url);
+
+  http.begin(client, url);
+  http.setTimeout(10000);
+  int code = http.GET();
+  
+  Serial.print("📡 HTTP code: ");
+  Serial.println(code);
+
+  if (code != 200) {
+    String payload = http.getString();
+    Serial.println("❌ Error HTTP: " + String(code));
+    http.end();
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  StaticJsonDocument<12288> doc;
+  
+  // Verifica si hubo errores en el parseo del Json
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("❌ Error parseando meds JSON: ");
+    Serial.println(err.c_str());
+    return false;
+  }
+
+  // ============ HASH =============
+  uint32_t currentHash = calculateMedsHash(doc);
+
+  Serial.print("🔢 Hash actual meds: ");
+  Serial.println(currentHash);
+
+  if (!forceSync && currentHash == g_lastMedsHash) {
+    Serial.println("✅ Sin cambios en medicamentos (hash coincide)");
+    return true;
+  }
+
+  if (g_lastMedsHash != 0) {
+    Serial.println("🔄 Cambios detectados — Resincronizando");
+  }
+  
+  g_lastMedsHash = currentHash;
+
+  // ==================================
+  //    REGENERAR ALARMAS EN EL UNO
+  // ==================================
+
+  Serial2.println("CLEAR");
+  delay(50);
+
+  if (!doc.containsKey("documents")) {
+    Serial.println("⚠️  Sin medicamentos");
+    return true;
+  }
+
+  JsonArray meds = doc["documents"].as<JsonArray>();
+  Serial.print("💊 Cantidad de meds: ");
+  Serial.println(meds.size());
+
+  for (JsonVariant V : meds) {
+    JsonObject o = V.as<JsonObject>();
+    JsonObject f = o["fields"];
+
+    const char* name = f["name"]["stringValue"] | "SinNombre";
+    const char* typeStr = f["type"]["stringValue"] | "everyDay";
+
+    int daysMask = (strcmp(typeStr, "everyOtherDay") == 0)
+                   ? 0   // lógica día por medio opcional
+                   : 127;
+
+    Serial.print("💊 Med: ");
+    Serial.print(name);
+    Serial.print(" (type=");
+    Serial.print(typeStr);
+    Serial.println(")");
+
+    JsonArray times = f["times24h"]["arrayValue"]["values"].as<JsonArray>();
+    
+    if (times.isNull() || times.size() == 0) {
+      Serial.println("⚠️  Med sin horarios, la salto");
+      continue;
+    }
+
+    for (JsonVariant T : times) {
+      const char* tstr = T["stringValue"] | "00:00";
+
+      int sep = String(tstr).indexOf(':');
+      int h = String(tstr).substring(0, sep).toInt();
+      int m = String(tstr).substring(sep + 1).toInt();
+
+      Serial.print("  ⏰ ");
+      Serial.print(h);
+      Serial.print(":");
+      Serial.print(m);
+      Serial.print(" mask=");
+      Serial.println(daysMask);
+
+      // TRUNCAR nombre a MAX_NAME_LENGTH , ES EL MAXIMO QUE PODEMOS ENVIAR PARA NO SATURAR LA RAM DEL ARDUINO!
+      String truncatedName = String(name);
+      if (truncatedName.length() > MAX_NAME_LENGTH) {
+        truncatedName = truncatedName.substring(0, MAX_NAME_LENGTH);
+        Serial.print("  ⚠️  Nombre truncado: ");
+        Serial.print(name);
+        Serial.print(" → ");
+        Serial.println(truncatedName);
+      }
+
+      char cmd[128];
+      snprintf(cmd, sizeof(cmd), "ADD:%d:%d:%d:1:%s", 
+               h, m, daysMask, truncatedName.c_str());
+
+      Serial.print("  📤 Enviando: ");
+      Serial.println(cmd);
+      Serial2.println(cmd);
+      delay(80);
+    }
+  }
+
+  Serial.println("✅ Sincronización completa");
+  return true;
+}
+
+// -----------------------------------------------------
+// Intento de sincronización completa
+// -----------------------------------------------------
+void attemptSync(bool forceSync = false) {
+  Serial.println("\n🔄 ==== INTENTO DE SINCRONIZACIÓN ====");
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⏭️  Sin WiFi, saltando sincronización");
+    return;
+  }
+
+  if (fetchOwnerUID()) {
+    if (fetchMedsForUserAndSync(forceSync)) {
+      Serial.println("✅ Sincronización exitosa");
+    } else {
+      Serial.println("⚠️  Error sincronizando meds");
+    }
+  } else {
+    Serial.println("⚠️  Dispositivo no vinculado");
+  }
+  
+  lastSyncAttempt = millis();
+}
+
+// ======== SETUP INICIAL ========
+void setup() {
+	//Configura canales seriales
+  Serial.begin(115200);
+  Serial2.begin(9600, SERIAL_8N1, UNO_RX, UNO_TX);
+
+  Serial.println("\n\n🚀 ESP32 PILLBOX - Iniciando...");
+  Serial.println("📋 Device ID: " + String(DEVICE_ID));
+
+  conectarWifi();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    delay(1000);
+     // Sincronizar hora con NTP
+    if (syncNTPTime()) {
+      delay(500);
+      sendTimeToArduino();
+    }
+    delay(1000);
+    attemptSync(true);  // Forzar sincronización inicial
+  } else {
+    Serial.println("⏭️  Sin WiFi en setup, reintentaré en el loop");
+    Serial2.println("WIFI:OFF");
+  }
+}
+
+// -----------------------------------------------------
+void loop() {
+  // Monitorizar WiFi cada 5 segundos
+  if (millis() - lastWifiCheck > 5000) {
+    lastWifiCheck = millis();
+    bool ahora = (WiFi.status() == WL_CONNECTED);
+    
+    if (ahora != lastWifiStatus) {
+      lastWifiStatus = ahora;
+      
+      if (ahora) {
+        Serial.println("✅ WiFi reconectado");
+        Serial2.println("WIFI:ON");
+
+        if (syncNTPTime()) {
+          delay(500);
+          sendTimeToArduino();
+        }
+
+        delay(1000);
+        attemptSync(true);  // Sincronizar inmediatamente
+
+      } else {
+        Serial.println("❌ WiFi perdido");
+        Serial2.println("WIFI:OFF");
+      }
+    }
+  }
+
+    // Sincronización periódica de hora (cada 1 hora)
+  if (ntpSynced && 
+      WiFi.status() == WL_CONNECTED && 
+      millis() - lastNTPSync > NTP_SYNC_INTERVAL) {
+    
+    Serial.println("\n🔄 Sincronización periódica de hora");
+    if (syncNTPTime()) {
+      delay(500);
+      sendTimeToArduino();
+    }
+  }
+
+  // Reintento si no está vinculado (cada 30s)
+  if (!deviceLinked &&
+      WiFi.status() == WL_CONNECTED &&
+      millis() - lastSyncAttempt > SYNC_RETRY_INTERVAL) {
+    attemptSync();
+  }
+
+  // Verificación periódica de vinculación (cada 5 minutos)
+  if (deviceLinked &&
+      WiFi.status() == WL_CONNECTED &&
+      millis() - lastLinkCheck > LINK_CHECK_INTERVAL) {
+
+    Serial.println("\n🔍 ==== VERIFICACIÓN PERIÓDICA ====");
+    lastLinkCheck = millis();
+
+    bool stillLinked = fetchOwnerUID();
+    
+    if (!stillLinked) {
+      Serial.println("⚠️  DISPOSITIVO DESVINCULADO REMOTAMENTE");
+      deviceLinked = false;
+      g_lastMedsHash = 0;
+      Serial2.println("CLEAR");
+      Serial2.println("DEVICE:UNLINKED");
+    } else {
+      Serial.println("✅ Vinculación verificada OK");
+      fetchMedsForUserAndSync(false);  // Solo si hay cambios
+    }
+  }
+
+  delay(100);  
+}
